@@ -1,114 +1,104 @@
 import sys
 import requests
+import logging
 import json
 import csv
 import os.path
 from timeit import default_timer as timer
+import argparse
 
-def get_agcros_data(endpoint):
+
+def get_agcros_data(endpoint, offset, limit):
     """
         Automates creation of csv files containing data retrieved from 
         the AgCROS public API.
         https://gpsr.ars.usda.gov/agcrospublicapi/swagger/index.html (Swagger API doc)
 
         :param endpoint: API endpoint with leading slash, as: /Measurement/SoilChemistry
-        :param offset: Records returnable in one call (Integer value)
-        :param limit: Total records returned (Integer value)
-        :param totalRecords: Total record quantity (Integer value)
+        :param offset: Records returnable in one call (integer value, default 2000)
+        :param limit: Total records returned (integer value, default 0)
         :return: returns nothing
     """
-    # TODO user defined params
-    totalRecords=58000
-    limit=10
-    offset=2000
-    
-    # if totalRecords > 1:
-    #     maxCalls = int(round(totalRecords / offset))
-    # else: 
-    #     maxCalls = 1
-    
-    # ----------------
-
-    log = []
-    current_offset = 0
-
-    maxCalls = 1
-
-    print '\nGetting data from AgCROS endpoint: "{0}" ... \n'.format(endpoint)
     url = 'https://gpsr.ars.usda.gov/agcrospublicapi/api/v1'
-    for req, i in enumerate(range(0, maxCalls)):
-        try:
-            response = requests.get(url + endpoint, {offset: current_offset, limit: limit})
-        except Exception as e:
-            print str(e)
-            return 'Request to AgCROS API unsuccessful. Please try again.'
-        log = build_response_log(log, response)
-        csv_filename = write_csv(response, endpoint)
-        current_offset += offset
+    totalRecords = getTotalRecords(url, endpoint)
 
-    write_log_file(log)
-    status = '**** Data successfully written to {0} ****'.format(csv_filename)
-    return status
+    #  Need better algo (Send requests until recordCount = totalRecords)
+    if totalRecords > offset:
+        maxRequests = int(round(totalRecords / offset))
+    else:
+        maxRequests = 1
+
+    cursor = 0
+    status = ''
+    print(f"\nGetting data from AgCROS endpoint: {endpoint} ... \n")
+    url = 'https://gpsr.ars.usda.gov/agcrospublicapi/api/v1'
+    for req in range(0, maxRequests):
+        try:
+            response = requests.get(url + endpoint, {offset: cursor, limit: limit})
+        except requests.exceptions.Timeout:
+            print(f'Request to {url + endpoint} timed out. Please try again.')
+            raise
+        except requests.exceptions.TooManyRedirects:
+            print('Bad Request. Please check your parameters and try again.')
+            raise
+        except requests.exceptions.RequestException as e:
+            raise SystemExit(e)
+
+        csv_filename = write_csv(response, endpoint)
+        cursor += offset
+
+    status = f'**** Data successfully written to {csv_filename} ****'
+    return status, csv_filename
+
+
+def getTotalRecords(url, endpoint):
+    try:
+         response = requests.get(url + endpoint, {'offset': 0, 'limit': 1})
+    except requests.exceptions.Timeout:
+        return f'Request timed to {url + endpoint} out. Please try again.'
+    except requests.exceptions.TooManyRedirects:
+        return 'Bad Request. Please check your parameters and try again.'
+    except requests.exceptions.RequestException as e:
+        raise SystemExit(e)
+    
+    response_dict = json.loads(response.content)
+    totalRecords = response_dict['totalCount']
+    return totalRecords
 
 def write_csv(response, endpoint):
     response_dict = json.loads(response.content)
     results = response_dict['result']
+    log_current =  f"First request returned status code {str(response.status_code)}, result count: {response_dict['resultCount']} of {response_dict['totalCount']} total results\n"
+    logging.debug('Current Request ')
+    logging.info(log_current)
 
     endpoint_paths = endpoint.split('/')
     endpoint_parent = endpoint_paths[1]
     endpoint_child = endpoint_paths[2]
-    csv_file_name = "agcros-api-{0}-{1}.csv".format(endpoint_parent, endpoint_child)
+    csv_file_name = f"agcros-api-{endpoint_parent}-{endpoint_child}.csv"
     
-    write_method = 'ab' if os.path.isfile(csv_file_name) else 'wb'
-    with open(csv_file_name, write_method) as f:
+    write_method = 'a' if os.path.isfile(csv_file_name) else 'w'
+    with open(csv_file_name, write_method, newline='') as f:
         writer = csv.DictWriter(f, results[0].keys())
-        if write_method == 'wb':
+        if write_method == 'w':
             writer.writeheader()
         for result in results:
             writer.writerow(result)
     return csv_file_name
 
-def build_response_log(log, response):
-    response_dict = json.loads(response.content)
-    log_current =  """First request returned status code {0}, result count: {1} of {2} total results\n
-                        """.format(str(response.status_code), response_dict['resultCount'], response_dict['totalCount'])
-    log.append(log_current)
-    return log
-
-def write_log_file(log):
-    with open("agcros-api-log.txt", 'w') as f:
-        for msg in log:
-            f.write(msg)
-
 if __name__ == "__main__":
     start_time = timer()
-    result_msg = ''
-    try:
-        endpoint = str(sys.argv[1])
-        # offset = int(sys.argv[2])
-        # limit = int(sys.argv[3])
-        # totalRecords = int(sys.argv[4])
-    except IndexError as e:
-        result_msg = """ 
-        **************************************************** 
-        Please pass the following arguments:
-        endpoint: 
-            /Measurement/SoilChemistry
-        offset: 
-            Records returnable in one call (Integer value)
-        limit: 
-            Total records returned (Integer value)
-        totalRecords:
-            Total record quantity (Integer value)
-        usage:
-            python usag-api-call.py <endpoint path>
-        *****************************************************
-        """
-        print result_msg
+    logging.basicConfig(filename='agCros-csv-writer.log',level=logging.DEBUG)
+    status_msg = ''
 
-    result_msg = get_agcros_data(endpoint)
-    # result_msg = get_agcros_data(endpoint, offset, limit, totalRecords)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("endpoint", help="The AgCROS endpoint to send a request to")
+    parser.add_argument("--offset", type=int, default=2000, help="Optional: the number of records to skip before taking the indicated number of records, defaults to 0")
+    parser.add_argument("--limit", type=int, default=0, help="Optional: the number of number of records to retrieve, defaulted to 2000")
+    
+    args = parser.parse_args()
+    status_msg, outFileName = get_agcros_data(args.endpoint, args.offset, args.limit)
+        
     elapsed = timer() - start_time
-
-    print result_msg 
-    print '**** Finished execution in {0} seconds ****\n'.format(elapsed)
+    print (status_msg) 
+    print ('**** Finished execution in {elapsed} seconds ****\n')
