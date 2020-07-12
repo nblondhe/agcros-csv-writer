@@ -3,10 +3,13 @@ import requests
 import logging
 import json
 import csv
-import os.path
+import os
+import glob
 from timeit import default_timer as timer
 import argparse
+import uuid
 
+API_URL = 'https://gpsr.ars.usda.gov/agcrospublicapi/api/v1'
 
 def get_agcros_data(endpoint, offset, limit):
     """
@@ -19,64 +22,68 @@ def get_agcros_data(endpoint, offset, limit):
         :param limit: Total records returned (integer value, default 0)
         :return: returns nothing
     """
-    url = 'https://gpsr.ars.usda.gov/agcrospublicapi/api/v1'
-    totalRecords = getTotalRecords(url, endpoint)
-
-    #  Need better algo (Send requests until recordCount = totalRecords)
-    if totalRecords > offset:
-        maxRequests = int(round(totalRecords / offset))
-    else:
-        maxRequests = 1
-
     cursor = 0
     status = ''
-    print(f"\nGetting data from AgCROS endpoint: {endpoint} ... \n")
-    url = 'https://gpsr.ars.usda.gov/agcrospublicapi/api/v1'
-    for req in range(0, maxRequests):
+    total_records_retrieved = 0
+    requests_made = 0
+    total_records_available = 0
+
+    print(f"\nRequesting data from AgCROS endpoint: {endpoint} ... \n")
+    while cursor <= total_records_available:
         try:
-            response = requests.get(url + endpoint, {offset: cursor, limit: limit})
-        except requests.exceptions.Timeout:
-            print(f'Request to {url + endpoint} timed out. Please try again.')
-            raise
-        except requests.exceptions.TooManyRedirects:
-            print('Bad Request. Please check your parameters and try again.')
-            raise
-        except requests.exceptions.RequestException as e:
+            response = requests.get(API_URL + endpoint, {'offset': cursor, 'limit': limit})
+        except requests.exceptions.Timeout as e:
+            print(f'Request to {API_URL + endpoint} timed out. Please try again.')
+            logging.WARN(e)
             raise SystemExit(e)
+        except requests.exceptions.TooManyRedirects as e:
+            print('Bad Request. Please check your parameters and try again.')
+            logging.WARN(e)
+            raise SystemExit(e)
+        except requests.exceptions.ConnectionError as e:
+            logging.WARN(e)
+            raise SystemExit(e)
+        except requests.exceptions.RequestException as e:
+            logging.WARN(e)
+            raise SystemExit(e)
+        except KeyboardInterrupt:
+            raise
+            print('Program exiting...')
+
+
 
         csv_filename = write_csv(response, endpoint)
+        
+        total_records_retrieved += json.loads(response.content)['resultCount']
+        total_records_available = json.loads(response.content)['totalCount']
         cursor += offset
+        requests_made += 1
+        
+        print(f"Total records retrieved {total_records_retrieved}")
+        print(f"Cursor {cursor}")
+        print(f"Requests made {requests_made}")
 
     status = f'**** Data successfully written to {csv_filename} ****'
     return status, csv_filename
 
-
-def getTotalRecords(url, endpoint):
-    try:
-         response = requests.get(url + endpoint, {'offset': 0, 'limit': 1})
-    except requests.exceptions.Timeout:
-        return f'Request timed to {url + endpoint} out. Please try again.'
-    except requests.exceptions.TooManyRedirects:
-        return 'Bad Request. Please check your parameters and try again.'
-    except requests.exceptions.RequestException as e:
-        raise SystemExit(e)
-    
-    response_dict = json.loads(response.content)
-    totalRecords = response_dict['totalCount']
-    return totalRecords
-
 def write_csv(response, endpoint):
+    id = uuid.uuid4().hex
     response_dict = json.loads(response.content)
     results = response_dict['result']
     log_current =  f"First request returned status code {str(response.status_code)}, result count: {response_dict['resultCount']} of {response_dict['totalCount']} total results\n"
-    logging.debug('Current Request ')
     logging.info(log_current)
 
     endpoint_paths = endpoint.split('/')
     endpoint_parent = endpoint_paths[1]
     endpoint_child = endpoint_paths[2]
-    csv_file_name = f"agcros-api-{endpoint_parent}-{endpoint_child}.csv"
-    
+    csv_file_prefix = f"agcros-api-{endpoint_parent}-{endpoint_child}"
+    csv_file_name = f"{csv_file_prefix}-{id}.csv"
+
+    previous_files = glob.glob(csv_file_prefix + "*")
+    if previous_files and previous_files[0] != csv_file_name:
+        os.remove(previous_files[0])
+        print('Previous file version found. Deleting...')
+
     write_method = 'a' if os.path.isfile(csv_file_name) else 'w'
     with open(csv_file_name, write_method, newline='') as f:
         writer = csv.DictWriter(f, results[0].keys())
@@ -97,8 +104,12 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, default=0, help="Optional: the number of number of records to retrieve, defaulted to 2000")
     
     args = parser.parse_args()
-    status_msg, outFileName = get_agcros_data(args.endpoint, args.offset, args.limit)
+    limit = args.limit if args.limit > 0 else args.offset 
+    print(f"endpoint {args.endpoint} limit {limit} offset {args.offset}")
+    status_msg, outFileName = get_agcros_data(args.endpoint, args.offset, limit)
         
     elapsed = timer() - start_time
+    time_msg = f'**** Finished execution in {elapsed} seconds ****\n'
     print (status_msg) 
-    print ('**** Finished execution in {elapsed} seconds ****\n')
+    print (time_msg)
+    logging.info(time_msg)
